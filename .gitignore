@@ -18,3 +18,25 @@ __pycache__/
 *.npz
 iris_voices/
 kokoro_models/
+
+# Python tooling caches and build outputs
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pyre/
+.cache/
+build/
+dist/
+*.egg-info/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor/OS local files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
