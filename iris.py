@@ -35,7 +35,9 @@ import iris_memory as mem
 MODEL_FAST   = os.getenv("IRIS_MODEL_FAST", "phi3.5")
 MODEL_SMART  = os.getenv("IRIS_MODEL_SMART", "llama3.1:8b")
 MEMORY_MODEL = os.getenv("IRIS_MEMORY_MODEL", "phi3.5")
-WHISPER_MODEL_NAME = os.getenv("IRIS_WHISPER_MODEL", "base.en")
+WHISPER_MODEL_NAME = os.getenv("IRIS_WHISPER_MODEL", "tiny.en")
+WHISPER_DEVICE = os.getenv("IRIS_WHISPER_DEVICE", "cpu").strip().lower()
+WHISPER_COMPUTE_TYPE = os.getenv("IRIS_WHISPER_COMPUTE_TYPE", "").strip().lower()
 WAKE_WORD    = "iris"
 WAKE_WORD_RE = re.compile(r"\b(?:hey\s+)?iris\b")
 WAKE_TARGETS = (
@@ -275,8 +277,13 @@ def ui_caption(text):
 
 print("🛠️  Iris Fast starting...")
 print(f"Loading Whisper {WHISPER_MODEL_NAME}...")
+
+if not WHISPER_COMPUTE_TYPE:
+    # GPU generally performs best with float16; CPU remains int8 by default.
+    WHISPER_COMPUTE_TYPE = "float16" if WHISPER_DEVICE == "cuda" else "int8"
+
 whisper_model = WhisperModel(
-    WHISPER_MODEL_NAME, device="cpu", compute_type="int8",
+    WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE,
     download_root=str(Path.home() / ".cache/whisper")
 )
 
@@ -295,7 +302,21 @@ user_name = memory["user"].get("name") or "sir"
 
 print(f"✓ Ready — user: {user_name}, interactions: {memory['interaction_count']}")
 print(f"Models → fast: {MODEL_FAST}, smart: {MODEL_SMART}, memory: {MEMORY_MODEL}")
+print(f"Whisper → model: {WHISPER_MODEL_NAME}, device: {WHISPER_DEVICE}, compute: {WHISPER_COMPUTE_TYPE}")
 print("Say 'Hey Iris' to activate.\n")
+
+
+def warmup_models():
+    """Warm up local models so first request avoids cold-start latency."""
+    for model_name in {MODEL_FAST, MODEL_SMART}:
+        try:
+            ollama.chat(model=model_name, messages=[{"role": "user", "content": "hi"}])
+            logging.info("Warmed up model: %s", model_name)
+        except Exception as e:
+            logging.warning("Warmup failed for %s: %s", model_name, e)
+
+
+threading.Thread(target=warmup_models, daemon=True).start()
 
 
 # ──────────────────────────────────────────────
@@ -433,6 +454,46 @@ def chat_with_retry(messages, model, retries=2, delay=0.8):
             else:
                 logging.error("Ollama call failed after retries for %s: %s", model, e)
     raise last_error
+
+
+def stream_and_speak(messages, model):
+    """Stream Ollama tokens and speak full sentences as soon as they complete."""
+    sentence_buffer = ""
+    full_reply = ""
+
+    try:
+        stream = ollama.chat(model=model, messages=messages, stream=True)
+        for chunk in stream:
+            token = ((chunk or {}).get("message") or {}).get("content", "")
+            if not token:
+                continue
+
+            sentence_buffer += token
+            full_reply += token
+
+            # Speak on sentence boundaries for lower perceived latency.
+            while True:
+                match = re.search(r"(.+?[.!?])(?:\s+|$)", sentence_buffer)
+                if not match:
+                    break
+
+                sentence = match.group(1).strip()
+                sentence_buffer = sentence_buffer[match.end():].lstrip()
+                if len(sentence.split()) > 3:
+                    speak(sentence, chunked=False)
+
+        leftover = sentence_buffer.strip()
+        if leftover and len(leftover.split()) > 2:
+            speak(leftover, chunked=False)
+
+        return full_reply.strip()
+    except Exception as e:
+        logging.warning("Streaming reply failed, using non-stream fallback: %s", e)
+        response = chat_with_retry(messages, model=model)
+        fallback_reply = response["message"]["content"].strip()
+        if fallback_reply:
+            speak(fallback_reply)
+        return fallback_reply
 
 
 def compact_spoken_reply(text, max_sentences=2, max_chars=260):
@@ -977,9 +1038,9 @@ def record_until_silence(
 
 def transcribe(audio):
     segments, _ = whisper_model.transcribe(
-        audio, beam_size=3, language="en",
+        audio, beam_size=1, language="en",
         vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400),
+        vad_parameters=dict(min_silence_duration_ms=300),
         initial_prompt=(
             "User may say: hey iris, open firefox, open dolphin, open discord, "
             "open steam, open terminal, open intellij, open vs code"
@@ -1876,7 +1937,7 @@ def execute_command(command):
             else:
                 set_brightness("down", brightness_request.get("amount", 10))
 
-        elif "open browser" in command or "open google" in command:
+        elif "open brow*ser" in command or "open google" in command:
             speak("Opening browser.")
             webbrowser.open("https://google.com")
 
@@ -2002,8 +2063,7 @@ def execute_command(command):
 
             selected_model = select_chat_model(command)
             logging.info("Model selected: %s", selected_model)
-            response = chat_with_retry(messages, model=selected_model)
-            reply = response['message']['content'].strip()
+            reply = stream_and_speak(messages, selected_model)
             reply = compact_spoken_reply(reply)
             if reply and reply[-1] not in ".!?":
                 reply += "."
@@ -2011,7 +2071,6 @@ def execute_command(command):
             mem.extract_extended_memory(memory, command, reply)
             mem.log_conversation(command, reply)
             mem.add_to_history(memory, "assistant", reply)
-            speak(reply)
 
     except SystemExit:
         raise
