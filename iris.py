@@ -32,6 +32,24 @@ except Exception:
 import iris_memory as mem
 import iris_skills
 
+# ── optional audio-enhancement libraries ──────────────────────────────────
+try:
+    import noisereduce as _nr
+    _NOISEREDUCE_AVAILABLE = True
+except ImportError:
+    _NOISEREDUCE_AVAILABLE = False
+    logging.warning("noisereduce not installed — skipping noise reduction. "
+                    "Run: pip install noisereduce")
+
+try:
+    from openwakeword.model import Model as _OWWModel
+    _OWW_AVAILABLE = True
+except ImportError:
+    _OWWModel = None
+    _OWW_AVAILABLE = False
+    logging.warning("openwakeword not installed — falling back to Whisper wake detection. "
+                    "Run: pip install openwakeword")
+
 # ============== IRIS FAST ==============
 MODEL_FAST   = os.getenv("IRIS_MODEL_FAST", "phi3.5")
 MODEL_SMART  = os.getenv("IRIS_MODEL_SMART", "llama3.1:8b")
@@ -80,6 +98,17 @@ DADDY_HOME_MUSIC = Path(__file__).resolve().parent / "The Clash - Should I Stay 
 
 SILENCE_THRESHOLD = 0.04
 SILENCE_DURATION  = 1.0
+
+# ── openWakeWord config ────────────────────────────────────────────────────
+OWW_WAKE_THRESHOLD     = float(os.getenv("IRIS_OWW_THRESHOLD",       "0.35"))
+OWW_DADDY_THRESHOLD    = float(os.getenv("IRIS_OWW_DADDY_THRESHOLD", "0.30"))
+OWW_CHUNK_SAMPLES      = 1280
+OWW_SAMPLE_RATE        = 16000
+OWW_POST_WAKE_RECORD_S = float(os.getenv("IRIS_OWW_POST_WAKE_S", "0.4"))
+
+# ── noise reduction config ─────────────────────────────────────────────────
+NR_PROP_DECREASE = float(os.getenv("IRIS_NR_PROP_DECREASE", "0.75"))
+
 ACTIVE_SILENCE_DURATION = 3.0
 ACTIVE_WAIT_TIMEOUT = 5.0
 ACTIVE_HARD_MAX_DURATION = 16.0
@@ -134,83 +163,313 @@ gui            = None
 # ──────────────────────────────────────────────
 
 class IrisVisualizer:
-    COLORS = {
-        "standby": "#6d8a96", "listening": "#2dd4bf",
-        "processing": "#ffb347", "speaking": "#ff7b54",
+    """
+    Iris HUD — Jarvis-style GUI with:
+      • Animated waveform orb (existing)
+      • Scrolling conversation transcript (last 5 exchanges)
+      • Live stats bar: CPU · RAM · Battery · Clock
+      • Mode label with colour coding
+    """
+
+    # ── colour palette ─────────────────────────────────────────────────────
+    BG          = "#071018"
+    PANEL_BG    = "#0b1a26"
+    BORDER      = "#112233"
+    TEXT_DIM    = "#4a6a7a"
+    TEXT_MID    = "#7aaabb"
+    TEXT_BRIGHT = "#d8ecf2"
+    ACCENT      = {
+        "standby":    "#6d8a96",
+        "listening":  "#2dd4bf",
+        "processing": "#ffb347",
+        "speaking":   "#ff7b54",
     }
-    SETTINGS = {
-        "standby":    (5.0,  0.06, 115.0),
-        "listening":  (11.0, 0.16, 120.0),
-        "processing": (16.0, 0.22, 122.0),
-        "speaking":   (24.0, 0.30, 126.0),
+
+    ORB_SETTINGS = {
+        "standby":    (5.0,  0.06, 72.0),
+        "listening":  (11.0, 0.16, 76.0),
+        "processing": (16.0, 0.22, 78.0),
+        "speaking":   (24.0, 0.30, 82.0),
     }
+
+    # ── layout constants (px) ──────────────────────────────────────────────
+    WIN_W         = 580
+    WIN_H         = 720
+    ORB_AREA_H    = 310
+    STATS_H       = 28
+    TRANSCRIPT_H  = 330
+    PAD           = 14
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Iris")
-        self.root.geometry("520x560")
-        self.root.configure(bg="#071018")
+        self.root.geometry(f"{self.WIN_W}x{self.WIN_H}")
+        self.root.configure(bg=self.BG)
+        self.root.resizable(False, False)
+
         self.mode    = "standby"
         self.caption = "Say 'Hey Iris'"
         self.phase   = 0.0
         self.events  = queue.SimpleQueue()
         self.running = True
-        self.canvas  = tk.Canvas(self.root, bg="#071018", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+
+        # Transcript: list of (role, text) tuples, newest at end
+        self._transcript: list[tuple[str, str]] = []
+        self._transcript_lock = threading.Lock()
+
+        self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(30, self._tick)
+        self.root.after(30,   self._tick)
+        self.root.after(1000, self._tick_stats)
+
+    # ── layout ─────────────────────────────────────────────────────────────
+
+    def _build_layout(self):
+        W, H = self.WIN_W, self.WIN_H
+
+        # Orb canvas (top)
+        self.orb_canvas = tk.Canvas(
+            self.root, width=W, height=self.ORB_AREA_H,
+            bg=self.BG, highlightthickness=0,
+        )
+        self.orb_canvas.place(x=0, y=0)
+
+        # Stats bar
+        self.stats_frame = tk.Frame(
+            self.root, bg=self.PANEL_BG,
+            height=self.STATS_H, width=W,
+        )
+        self.stats_frame.place(x=0, y=self.ORB_AREA_H)
+
+        self.stats_label = tk.Label(
+            self.stats_frame, bg=self.PANEL_BG,
+            fg=self.TEXT_DIM, font=("Courier", 9),
+            text="", anchor="w", padx=self.PAD,
+        )
+        self.stats_label.pack(fill="both", expand=True)
+
+        # Separator line
+        sep = tk.Frame(self.root, bg=self.BORDER, height=1, width=W)
+        sep.place(x=0, y=self.ORB_AREA_H + self.STATS_H)
+
+        # Transcript panel (bottom)
+        trans_y = self.ORB_AREA_H + self.STATS_H + 1
+        self.trans_canvas = tk.Canvas(
+            self.root, width=W, height=self.TRANSCRIPT_H,
+            bg=self.PANEL_BG, highlightthickness=0,
+        )
+        self.trans_canvas.place(x=0, y=trans_y)
+
+    # ── event API (called from worker threads) ─────────────────────────────
+
+    def post_mode(self, mode: str):
+        self.events.put(("mode", mode))
+
+    def post_caption(self, caption: str):
+        self.events.put(("caption", caption))
+
+    def post_transcript(self, role: str, text: str):
+        """Add a line to the conversation transcript."""
+        self.events.put(("transcript", (role, text)))
+
+    def request_close(self):
+        self.events.put(("close", None))
+
+    # ── internal event pump ────────────────────────────────────────────────
+
+    def _apply_events(self):
+        while not self.events.empty():
+            try:
+                event, value = self.events.get_nowait()
+            except Exception:
+                break
+            if event == "mode" and value in self.ORB_SETTINGS:
+                self.mode = value
+            elif event == "caption" and isinstance(value, str):
+                self.caption = value[:90]
+            elif event == "transcript" and isinstance(value, tuple):
+                role, text = value
+                with self._transcript_lock:
+                    self._transcript.append((role, text))
+                    # Keep only last 10 lines (5 exchanges × 2)
+                    if len(self._transcript) > 10:
+                        self._transcript = self._transcript[-10:]
+            elif event == "close":
+                self._on_close()
 
     def _on_close(self):
         global app_running
-        self.running = False
-        app_running  = False
+        self.running  = False
+        app_running   = False
         try:
             self.root.destroy()
         except Exception:
             pass
 
-    def post_mode(self, mode):       self.events.put(("mode", mode))
-    def post_caption(self, caption): self.events.put(("caption", caption))
-    def request_close(self):         self.events.put(("close", None))
-
-    def _apply_events(self):
-        while not self.events.empty():
-            event, value = self.events.get()
-            if event == "mode" and value in self.SETTINGS:
-                self.mode = value
-            elif event == "caption" and isinstance(value, str):
-                self.caption = value[:80]
-            elif event == "close":
-                self._on_close()
+    # ── orb drawing ────────────────────────────────────────────────────────
 
     def _draw_orb(self):
-        width  = max(self.canvas.winfo_width(),  520)
-        height = max(self.canvas.winfo_height(), 560)
-        cx, cy = width / 2, height / 2 - 18
-        amp, speed, base_radius = self.SETTINGS.get(self.mode, self.SETTINGS["standby"])
-        color = self.COLORS.get(self.mode, self.COLORS["standby"])
+        W  = self.WIN_W
+        H  = self.ORB_AREA_H
+        cx = W / 2
+        cy = H / 2 - 10
+        amp, speed, base_r = self.ORB_SETTINGS.get(self.mode, self.ORB_SETTINGS["standby"])
+        color = self.ACCENT.get(self.mode, self.ACCENT["standby"])
         self.phase += speed
+
         points = []
-        for deg in range(0, 360, 6):
+        for deg in range(0, 360, 5):
             ang  = math.radians(deg)
-            wave = amp * (0.60 * math.sin(3.0 * ang + self.phase)
-                          + 0.40 * math.sin(7.0 * ang - 1.3 * self.phase))
-            r = base_radius + wave
+            wave = amp * (
+                0.60 * math.sin(3.0 * ang + self.phase)
+                + 0.40 * math.sin(7.0 * ang - 1.3 * self.phase)
+            )
+            r = base_r + wave
             points.extend([cx + r * math.cos(ang), cy + r * math.sin(ang)])
-        self.canvas.delete("all")
-        self.canvas.create_oval(cx-98, cy-98, cx+98, cy+98, fill="#0c1b28", outline="")
-        self.canvas.create_polygon(points, outline=color, fill="", width=3, smooth=True)
-        self.canvas.create_oval(cx-26, cy-26, cx+26, cy+26, fill=color, outline="")
-        self.canvas.create_text(cx, cy+145, text=f"Iris • {self.mode}",
-                                fill="#d8ecf2", font=("Helvetica", 16, "bold"))
-        self.canvas.create_text(cx, cy+178, text=self.caption,
-                                fill="#90a9b5", font=("Helvetica", 12))
+
+        c = self.orb_canvas
+        c.delete("all")
+
+        # Outer dark ring
+        c.create_oval(cx-base_r-18, cy-base_r-18,
+                      cx+base_r+18, cy+base_r+18,
+                      fill=self.PANEL_BG, outline=self.BORDER, width=1)
+        # Waveform
+        c.create_polygon(points, outline=color, fill="", width=2, smooth=True)
+        # Inner core dot
+        c.create_oval(cx-18, cy-18, cx+18, cy+18, fill=color, outline="")
+
+        # Mode text
+        c.create_text(cx, cy + base_r + 28,
+                      text=f"IRIS  ·  {self.mode.upper()}",
+                      fill=color, font=("Courier", 11, "bold"))
+        # Caption
+        c.create_text(cx, cy + base_r + 50,
+                      text=self.caption,
+                      fill=self.TEXT_MID, font=("Helvetica", 10))
+
+        # Corner accent lines (Jarvis-style)
+        for x0, y0, x1, y1 in [
+            (8, 8, 40, 8), (8, 8, 8, 40),
+            (W-8, 8, W-40, 8), (W-8, 8, W-8, 40),
+            (8, H-8, 40, H-8), (8, H-8, 8, H-40),
+            (W-8, H-8, W-40, H-8), (W-8, H-8, W-8, H-40),
+        ]:
+            c.create_line(x0, y0, x1, y1, fill=self.TEXT_DIM, width=1)
+
+    # ── stats bar ──────────────────────────────────────────────────────────
+
+    def _tick_stats(self):
+        if not self.running:
+            return
+        try:
+            cpu  = psutil.cpu_percent(interval=None)
+            ram  = psutil.virtual_memory()
+            bat  = psutil.sensors_battery()
+            now  = datetime.now().strftime("%H:%M:%S")
+
+            bat_str = ""
+            if bat:
+                plug = "⚡" if bat.power_plugged else "🔋"
+                bat_str = f"  {plug}{bat.percent:.0f}%"
+
+            stats = (
+                f"  CPU {cpu:4.1f}%  "
+                f"RAM {ram.percent:4.1f}%"
+                f"{bat_str}  "
+                f"🕐 {now}"
+            )
+            self.stats_label.config(text=stats)
+        except Exception:
+            pass
+        self.root.after(1000, self._tick_stats)
+
+    # ── transcript drawing ─────────────────────────────────────────────────
+
+    def _draw_transcript(self):
+        c  = self.trans_canvas
+        W  = self.WIN_W
+        H  = self.TRANSCRIPT_H
+        P  = self.PAD
+
+        c.delete("all")
+
+        # Panel header
+        c.create_text(P, 12, text="CONVERSATION", anchor="w",
+                      fill=self.TEXT_DIM, font=("Courier", 8, "bold"))
+        c.create_line(P, 22, W - P, 22, fill=self.BORDER, width=1)
+
+        with self._transcript_lock:
+            lines = list(self._transcript)
+
+        if not lines:
+            c.create_text(W // 2, H // 2,
+                          text="No conversation yet",
+                          fill=self.TEXT_DIM, font=("Helvetica", 10))
+            return
+
+        # Draw newest at bottom — walk backwards from bottom of canvas
+        y      = H - 10
+        max_w  = W - P * 2 - 60
+
+        for role, text in reversed(lines):
+            is_iris  = (role == "assistant")
+            label    = "IRIS " if is_iris else "YOU  "
+            lcolor   = self.ACCENT.get(self.mode, self.ACCENT["standby"]) if is_iris else self.TEXT_MID
+            tcolor   = self.TEXT_BRIGHT if is_iris else self.TEXT_MID
+            font_lbl = ("Courier",  8, "bold")
+            font_txt = ("Helvetica", 9)
+
+            # Word-wrap text
+            words = text.split()
+            wrapped_lines: list[str] = []
+            current = ""
+            char_limit = max(20, int(max_w / 5.5))
+            for word in words:
+                if len(current) + len(word) + 1 <= char_limit:
+                    current = (current + " " + word).strip()
+                else:
+                    if current:
+                        wrapped_lines.append(current)
+                    current = word
+            if current:
+                wrapped_lines.append(current)
+            wrapped_lines = wrapped_lines[:3]
+
+            line_h = 14
+            block_h = len(wrapped_lines) * line_h + 4
+
+            # Draw text lines bottom-up
+            for i, wl in enumerate(reversed(wrapped_lines)):
+                ty = y - i * line_h
+                if ty < 30:
+                    break
+                c.create_text(P + 52, ty, text=wl, anchor="sw",
+                               fill=tcolor, font=font_txt)
+
+            # Draw role label at top of this block
+            c.create_text(P, y - (len(wrapped_lines) - 1) * line_h,
+                           text=label, anchor="sw",
+                           fill=lcolor, font=font_lbl)
+
+            # Separator line between entries
+            sep_y = y - block_h + 1
+            if sep_y > 28:
+                c.create_line(P, sep_y, W - P, sep_y,
+                              fill=self.BORDER, width=1, dash=(2, 6))
+
+            y -= block_h + 4
+            if y < 30:
+                break
+
+    # ── main tick ──────────────────────────────────────────────────────────
 
     def _tick(self):
         if not self.running:
             return
         self._apply_events()
         self._draw_orb()
+        self._draw_transcript()
         self.root.after(30, self._tick)
 
     def run(self):
@@ -222,6 +481,10 @@ def ui_mode(mode):
 
 def ui_caption(text):
     if gui: gui.post_caption(text)
+
+def ui_transcript(role: str, text: str):
+    """Push a new line to the HUD transcript panel."""
+    if gui: gui.post_transcript(role, text)
 
 
 # ──────────────────────────────────────────────
@@ -253,6 +516,26 @@ user_name = memory["user"].get("name") or "sir"
 
 iris_skills.load_skills()
 
+# ── openWakeWord model init ────────────────────────────────────────────────
+_oww_model  = None
+_oww_lock   = threading.Lock()
+
+def _init_oww():
+    global _oww_model
+    if not _OWW_AVAILABLE:
+        return
+    try:
+        import openwakeword as _oww_pkg, os as _os
+        _models_dir = _os.path.join(_os.path.dirname(_oww_pkg.__file__), "resources", "models")
+        _jarvis     = _os.path.join(_models_dir, "hey_jarvis_v0.1.onnx")
+        with _oww_lock:
+            _oww_model = _OWWModel(wakeword_model_paths=[_jarvis])
+        print(f"✓ openWakeWord ready  (model: hey_jarvis proxy, threshold: {OWW_WAKE_THRESHOLD})")
+    except Exception as _e:
+        logging.warning("openWakeWord init failed: %s — using Whisper fallback.", _e)
+
+threading.Thread(target=_init_oww, daemon=True).start()
+
 print(f"✓ Ready — user: {user_name}, interactions: {memory['interaction_count']}")
 print(f"Models → fast: {MODEL_FAST}, smart: {MODEL_SMART}, memory: {MEMORY_MODEL}")
 print(f"Whisper → {WHISPER_MODEL_NAME} / {WHISPER_DEVICE} / {WHISPER_COMPUTE_TYPE}")
@@ -267,6 +550,8 @@ def warmup_models():
             logging.info("Warmed up: %s", model_name)
         except Exception as e:
             logging.warning("Warmup failed for %s: %s", model_name, e)
+
+threading.Thread(target=warmup_models, daemon=True).start()
 
 
 # ──────────────────────────────────────────────
@@ -843,6 +1128,18 @@ def record_until_silence(
 
 
 def transcribe(audio):
+    # ── noise reduction ────────────────────────────────────────────────────
+    if _NOISEREDUCE_AVAILABLE and audio is not None and len(audio) > 0:
+        try:
+            audio = _nr.reduce_noise(
+                y=audio,
+                sr=16000,
+                stationary=True,
+                prop_decrease=NR_PROP_DECREASE,
+            )
+        except Exception as _nr_err:
+            logging.debug("noisereduce skipped: %s", _nr_err)
+
     segments, _ = whisper_model.transcribe(
         audio, beam_size=1, language="en", vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300),
@@ -859,7 +1156,7 @@ def transcribe(audio):
 
 
 # ──────────────────────────────────────────────
-# EXECUTE COMMAND  ← now just ~30 lines
+# EXECUTE COMMAND
 # ──────────────────────────────────────────────
 
 def execute_command(command):
@@ -898,7 +1195,8 @@ def execute_command(command):
         if handled:
             if reply:
                 speak(reply)
-            # log to memory regardless
+                ui_transcript("user",      command)
+                ui_transcript("assistant", reply)
             mem.extract_extended_memory(memory, command, reply or "")
             mem.log_conversation(command, reply or "")
             if reply:
@@ -937,6 +1235,8 @@ def execute_command(command):
         if reply and reply[-1] not in ".!?":
             reply += "."
 
+        ui_transcript("user",      command)
+        ui_transcript("assistant", reply)
         mem.extract_extended_memory(memory, command, reply)
         mem.log_conversation(command, reply)
         mem.add_to_history(memory, "assistant", reply)
@@ -955,6 +1255,84 @@ def execute_command(command):
 # MAIN LOOP
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# OPENWAKEWORD STANDBY LISTENER
+# ──────────────────────────────────────────────
+
+def _oww_standby_listen() -> str:
+    """
+    Stream mic in 80ms chunks through openWakeWord.
+    Returns one of: "wake" | "daddy" | "exit" | "none"
+    """
+    fs          = OWW_SAMPLE_RATE
+    chunk       = OWW_CHUNK_SAMPLES
+    pre_buffer  = []
+    pre_max     = int(1.5 * fs / chunk)
+
+    CONFIRM_FRAMES = 2
+    wake_streak    = 0
+
+    try:
+        with sd.InputStream(samplerate=fs, channels=1, dtype="float32",
+                            blocksize=chunk) as stream:
+            while app_running and not is_active:
+                if is_speaking:
+                    time.sleep(0.05)
+                    continue
+
+                raw, _ = stream.read(chunk)
+                raw    = np.squeeze(raw)
+
+                pre_buffer.append(raw.copy())
+                if len(pre_buffer) > pre_max:
+                    pre_buffer.pop(0)
+
+                with _oww_lock:
+                    if _oww_model is None:
+                        return "none"
+                    scores = _oww_model.predict(raw)
+
+                best_score = max(scores.values()) if scores else 0.0
+
+                # ── daddy-home: lower threshold, check via Whisper ────────
+                if best_score >= OWW_DADDY_THRESHOLD:
+                    post_chunks = int(OWW_POST_WAKE_RECORD_S * fs / chunk)
+                    post_buf    = list(pre_buffer)
+                    for _ in range(post_chunks):
+                        try:
+                            extra, _ = stream.read(chunk)
+                            post_buf.append(np.squeeze(extra))
+                        except Exception:
+                            break
+
+                    verify_audio = np.concatenate(post_buf).astype(np.float32)
+                    heard        = quick_transcribe(verify_audio)
+                    print(f"[OWW trigger {best_score:.2f}] Whisper heard: '{heard}'")
+
+                    if heard and is_exit_intent(heard):
+                        return "exit"
+                    if heard and is_daddy_home_detected(heard):
+                        return "daddy"
+
+                # ── wake: require CONFIRM_FRAMES consecutive hits ─────────
+                if best_score >= OWW_WAKE_THRESHOLD:
+                    wake_streak += 1
+                    if wake_streak >= CONFIRM_FRAMES:
+                        print(f"[OWW] Wake confirmed  score={best_score:.3f}")
+                        with _oww_lock:
+                            if _oww_model:
+                                _oww_model.reset()
+                        wake_streak = 0
+                        return "wake"
+                else:
+                    wake_streak = 0
+
+    except Exception as exc:
+        logging.warning("OWW standby listener error: %s", exc)
+
+    return "none"
+
+
 def run_assistant_loop():
     global is_active
 
@@ -964,8 +1342,30 @@ def run_assistant_loop():
                 time.sleep(0.05); continue
 
             if not is_active:
-                print("👂 Standby...")
+                print("👂 Standby (openWakeWord)..." if _oww_model else "👂 Standby (Whisper)...")
                 ui_mode("standby"); ui_caption("Say 'Hey Iris'")
+
+                # ── OWW streaming standby ─────────────────────────────────
+                if _oww_model:
+                    _woke = _oww_standby_listen()
+                    if _woke == "wake":
+                        is_active = True
+                        ui_mode("listening"); ui_caption("Listening")
+                        name = memory["user"].get("name")
+                        if memory["interaction_count"] == 0:
+                            greeting = "Iris online. What's your name?"
+                        elif name:
+                            greeting = f"Online. Good to have you back, {name}."
+                        else:
+                            greeting = "Online. What do you need?"
+                        speak(greeting, chunked=False)
+                    elif _woke == "daddy":
+                        threading.Thread(target=daddy_home_entry, daemon=True).start()
+                    elif _woke == "exit":
+                        shutdown()
+                    continue
+
+                # ── Whisper fallback standby (OWW not available) ──────────
                 audio, _ = record_until_silence(max_duration=None)
                 text = transcribe(audio)
                 if not text: continue
@@ -1018,9 +1418,6 @@ def main():
     has_display  = bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
     tk_available = tk is not None
     use_gui      = tk_available and gui_enabled and has_display
-
-    print("Warming up models before standby...")
-    warmup_models()
 
     if use_gui:
         gui    = IrisVisualizer()

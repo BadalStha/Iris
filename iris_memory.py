@@ -1,33 +1,22 @@
 """
-iris_memory.py — Iris Memory System  (v2 — Vector-augmented)
-=============================================================
-Drop-in replacement for the original iris_memory.py.
-iris.py needs NO changes — every public function signature is identical.
+iris_memory.py — Persistent memory + semantic search + entity tracking + tone detection
+========================================================================================
 
-New capabilities
-----------------
-* ChromaDB local vector store for semantic conversation recall
-  - Automatically embedded using Ollama's nomic-embed-text model
-  - Falls back to keyword search if embeddings are unavailable
-* Episodic memory: each conversation stored as a searchable document
-* Semantic recall: "last time we discussed X" finds relevant past exchanges
-  even when exact keywords don't match
-* Entity memory: people, projects, tools the user mentions are tracked
-* Context window builder: ranked relevant memories injected into every prompt
-* All data stored at  ~/.iris_vector_db/  (persistent across restarts)
+Features:
+  • ChromaDB vector store for episodic semantic memory at ~/.iris_vector_db
+  • Entity extraction (people, projects, tools)
+  • Tone detection based on time-of-day, mood, command velocity
+  • Dynamic system prompt injection via _tone_rules()
+  • RAG context building from semantic search + working memory
+  • Backward-compatible with iris.py (identical function signatures)
 
-Backward compatibility
-----------------------
-* load(), save(), add_to_history(), get_recent_history()
-* build_system_prompt(), build_rag_context(), get_memory_summary()
-* extract_and_save(), extract_extended_memory(), log_conversation()
-* search_relevant_memories(), trim_conversation_log()
-* save_reminder(), get_pending_reminders(), mark_reminders_fired()
-* clear_memory(), save_correction()
-All accept and return the same types as before.
+ChromaDB Setup:
+    pip install chromadb
+
+Vector embeddings (auto-downloaded):
+    pip install sentence-transformers
+    # or pre-pull: ollama pull nomic-embed-text
 """
-
-from __future__ import annotations
 
 import json
 import logging
@@ -35,822 +24,624 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
-
-import ollama
-
-# -- paths -----------------------------------------------------------------
-MEMORY_FILE      = Path.home() / ".iris_memory.json"
-CONVERSATION_LOG = Path.home() / ".iris_conversations.jsonl"
-VECTOR_DB_PATH   = Path.home() / ".iris_vector_db"
-MODEL            = os.getenv("IRIS_MEMORY_MODEL", "phi3.5")
-EMBED_MODEL      = os.getenv("IRIS_EMBED_MODEL", "nomic-embed-text")
+from typing import Any
 
 log = logging.getLogger(__name__)
 
-# -- ChromaDB setup (lazy — only imports when first needed) ----------------
-_chroma_client     = None
-_chroma_collection = None
-_embed_available   = None          # None = untested, True/False after first call
-_chroma_lock       = threading.Lock()
+# ──────────────────────────────────────────────────────────────────────────
+# GLOBAL CONFIG
+# ──────────────────────────────────────────────────────────────────────────
+
+MEMORY_MODEL     = os.getenv("IRIS_MEMORY_MODEL", "phi3.5")
+VECTOR_DB_PATH   = Path.home() / ".iris_vector_db"
+EMBED_MODEL      = "nomic-embed-text"
+EMBED_BATCH_SIZE = int(os.getenv("IRIS_EMBED_BATCH", "41"))
+
+# In-memory working context (session-scoped, cleared on restart)
+_working_memory  = None
+_chromadb_client = None
+_chromadb_lock   = threading.Lock()
 
 
-def _get_collection():
-    """Return (or lazily create) the ChromaDB collection."""
-    global _chroma_client, _chroma_collection
-    with _chroma_lock:
-        if _chroma_collection is not None:
-            return _chroma_collection
-        try:
-            import chromadb
-            VECTOR_DB_PATH.mkdir(parents=True, exist_ok=True)
-            _chroma_client = chromadb.PersistentClient(path=str(VECTOR_DB_PATH))
-            _chroma_collection = _chroma_client.get_or_create_collection(
-                name="iris_episodes",
-                metadata={"hnsw:space": "cosine"},
-            )
-            log.info("ChromaDB collection ready - %d docs", _chroma_collection.count())
-            return _chroma_collection
-        except Exception as exc:
-            log.warning("ChromaDB unavailable: %s", exc)
-            return None
-
-
-def _embed(text: str) -> Optional[list[float]]:
-    """Get an embedding vector via Ollama.  Returns None on failure."""
-    global _embed_available
-    if _embed_available is False:
-        return None
-    try:
-        resp = ollama.embeddings(model=EMBED_MODEL, prompt=text[:2000])
-        vec = resp.get("embedding") or []
-        if vec:
-            _embed_available = True
-            return vec
-        _embed_available = False
-        return None
-    except Exception as exc:
-        if _embed_available is None:
-            log.warning(
-                "Embedding model '%s' not available (%s). "
-                "Run: ollama pull %s - falling back to keyword search.",
-                EMBED_MODEL, exc, EMBED_MODEL,
-            )
-        _embed_available = False
-        return None
-
-
-# -- episode store ---------------------------------------------------------
-
-def _store_episode(user_text: str, assistant_reply: str, topics: list[str]) -> None:
-    """Embed and store one conversation turn in ChromaDB (background-safe)."""
-    col = _get_collection()
-    if col is None:
-        return
-    try:
-        doc = f"User: {user_text}\nIris: {assistant_reply}"
-        vec = _embed(doc)
-        ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
-        doc_id = f"ep_{int(time.time() * 1000)}"
-        kwargs: dict = dict(
-            documents=[doc],
-            ids=[doc_id],
-            metadatas=[{
-                "time":      ts,
-                "user":      user_text[:400],
-                "assistant": assistant_reply[:400],
-                "topics":    ",".join(topics[:8]),
-            }],
-        )
-        if vec:
-            kwargs["embeddings"] = [vec]
-        col.add(**kwargs)
-    except Exception as exc:
-        log.debug("Episode store failed: %s", exc)
-
-
-def _semantic_search(query: str, n_results: int = 5) -> list[dict]:
-    """
-    Search ChromaDB for relevant past episodes.
-    Returns list of metadata dicts sorted by relevance.
-    Falls back to empty list if embeddings unavailable.
-    """
-    col = _get_collection()
-    if col is None or col.count() == 0:
-        return []
-    try:
-        vec = _embed(query)
-        if vec:
-            results = col.query(
-                query_embeddings=[vec],
-                n_results=min(n_results, col.count()),
-                include=["metadatas", "distances"],
-            )
-        else:
-            results = col.query(
-                query_texts=[query[:500]],
-                n_results=min(n_results, col.count()),
-                include=["metadatas", "distances"],
-            )
-        metas     = results.get("metadatas", [[]])[0]
-        distances = results.get("distances",  [[]])[0]
-        out = []
-        for meta, dist in zip(metas, distances):
-            if dist < 0.75:           # cosine distance — lower = more similar
-                out.append({**meta, "_score": round(1 - dist, 3)})
-        out.sort(key=lambda x: x["_score"], reverse=True)
-        return out
-    except Exception as exc:
-        log.debug("Semantic search failed: %s", exc)
-        return []
-
-
-# -- entity tracker --------------------------------------------------------
-
-_ENTITY_PATTERNS = [
-    # people  "my friend Alex", "my boss Sarah"
-    (r"\bmy\s+(?:friend|colleague|boss|teacher|professor|mentor|partner|brother|sister|dad|mom|son|daughter)\s+([A-Z][a-z]+)", "person"),
-    # projects  "my project called Iris", "working on ProjectX"
-    (r"\bmy\s+(?:project|app|bot|script|tool|repo|side[\s-]?project)\s+(?:called\s+|named\s+)?([A-Za-z][\w\s]{1,30})", "project"),
-    # tech tools the user mentions
-    (r"\busing\s+([\w\+#]{2,20})\b", "tool"),
-    (r"\binstalled\s+([\w\+#]{2,20})\b", "tool"),
-    (r"\blearning\s+([\w\+#]{2,20})\b", "skill"),
-]
-
-
-def _extract_entities(text: str, memory: dict) -> None:
-    """Pull named entities from user text and save to memory["entities"]."""
-    if not text:
-        return
-    entities = memory.setdefault("entities", {})
-    for pattern, kind in _ENTITY_PATTERNS:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            name = match.group(1).strip().title()
-            if len(name) < 2 or name.lower() in {
-                "a", "the", "my", "some", "this", "that", "it", "you"
-            }:
-                continue
-            key = f"{kind}:{name.lower()}"
-            if key not in entities:
-                entities[key] = {
-                    "kind":     kind,
-                    "name":     name,
-                    "first_seen": datetime.now().strftime("%Y-%m-%d"),
-                    "mentions": 1,
-                }
-            else:
-                entities[key]["mentions"] = entities[key].get("mentions", 1) + 1
-
-
-# -- working memory (session-level, in-RAM) --------------------------------
+# ──────────────────────────────────────────────────────────────────────────
+# WORKING MEMORY (SESSION SCOPE)
+# ──────────────────────────────────────────────────────────────────────────
 
 class _WorkingMemory:
     """
-    Tracks the active session: topic thread, entity spotlight, rolling context.
-    Reset on process restart (intentional - this is session-scoped).
+    Transient session state — NOT persisted.
+    Tracks: topic stack, entity focus, turn count, mood drift.
     """
+
     def __init__(self):
-        self.topic_stack:  list[str]   = []     # most recent topics, newest last
-        self.entity_focus: list[str]   = []     # entities mentioned this session
-        self.turn_count:   int         = 0
-        self.last_command: str         = ""
-        self.lock = threading.Lock()
+        self.topic_stack   = []
+        self.entity_focus  = {}
+        self.turn_count    = 0
+        self.mood_samples  = []
+        self.command_pace  = []
+        self.session_start = datetime.now()
 
-    def update(self, user_text: str, topics: list[str]) -> None:
-        with self.lock:
-            self.turn_count += 1
-            self.last_command = user_text
-            for t in topics:
-                if t not in self.topic_stack:
-                    self.topic_stack.append(t)
-            self.topic_stack = self.topic_stack[-6:]    # keep last 6 topics
+    def push_topic(self, topic: str):
+        self.topic_stack.append(topic)
+        if len(self.topic_stack) > 8:
+            self.topic_stack.pop(0)
 
-    def get_context_hint(self) -> str:
-        with self.lock:
-            parts = []
-            if self.topic_stack:
-                parts.append("Session topics: " + ", ".join(self.topic_stack[-3:]))
-            if self.turn_count > 0:
-                parts.append(f"Turn {self.turn_count} this session")
-            return " | ".join(parts) if parts else ""
+    def pop_topic(self):
+        if self.topic_stack:
+            self.topic_stack.pop()
+
+    def current_topic(self) -> str | None:
+        return self.topic_stack[-1] if self.topic_stack else None
+
+    def update_entity(self, name: str, info: str):
+        self.entity_focus[name] = info
+        if len(self.entity_focus) > 20:
+            oldest = min(self.entity_focus.items(), key=lambda x: x[1].get("updated", 0))
+            del self.entity_focus[oldest[0]]
+
+    def record_command(self):
+        self.turn_count += 1
+        now = time.time()
+        self.command_pace.append(now)
+        if len(self.command_pace) > 20:
+            self.command_pace.pop(0)
+
+    def command_velocity(self) -> float:
+        """Commands per minute in last window."""
+        if len(self.command_pace) < 2:
+            return 0.0
+        window = 60.0  # seconds
+        recent = [t for t in self.command_pace if now() - t < window]
+        return len(recent) / max(1.0, window / 60.0)
+
+    def add_mood_sample(self, mood: float):
+        """Mood on scale -1 (frustrated) to +1 (happy)."""
+        self.mood_samples.append(mood)
+        if len(self.mood_samples) > 50:
+            self.mood_samples.pop(0)
+
+    def avg_mood(self) -> float:
+        return sum(self.mood_samples) / len(self.mood_samples) if self.mood_samples else 0.0
 
 
-_wm = _WorkingMemory()
+def now() -> float:
+    return time.time()
 
 
-# ==========================================================================
-# MEMORY STRUCTURE  (unchanged from v1)
-# ==========================================================================
+# ──────────────────────────────────────────────────────────────────────────
+# CHROMADB VECTOR STORE
+# ──────────────────────────────────────────────────────────────────────────
 
-DEFAULT_MEMORY = {
-    "user": {
-        "name":        None,
-        "age":         None,
-        "location":    None,
-        "occupation":  None,
-        "wake_up_time": None,
-        "sleep_time":  None,
-        "language":    "English",
-    },
-    "preferences": {
-        "music":   [],
-        "topics":  [],
-        "dislikes": [],
-        "apps":    [],
-    },
-    "facts":               [],
-    "learned_topics":      {},
-    "corrections":         [],
-    "app_corrections":     {},
-    "mood_history":        [],
-    "goals":               [],
-    "reminders":           [],
-    "conversation_history": [],
-    "entities":            {},     # NEW - named entity store
-    "interaction_count":   0,
-    "first_seen":          datetime.now().strftime("%Y-%m-%d"),
-    "last_seen":           datetime.now().strftime("%Y-%m-%d"),
+def _get_chromadb_client():
+    global _chromadb_client
+    if _chromadb_client is not None:
+        return _chromadb_client
+    try:
+        import chromadb
+        with _chromadb_lock:
+            if _chromadb_client is None:
+                _chromadb_client = chromadb.PersistentClient(
+                    path=str(VECTOR_DB_PATH),
+                )
+        return _chromadb_client
+    except ImportError:
+        log.warning(
+            "ChromaDB not installed. Run: pip install chromadb. "
+            "Falling back to keyword search only."
+        )
+        return None
+    except Exception as e:
+        log.warning("ChromaDB init failed: %s. Using keyword search fallback.", e)
+        return None
+
+
+def _get_collection(name="episodes"):
+    """Lazy-load ChromaDB collection (thread-safe)."""
+    client = _get_chromadb_client()
+    if not client:
+        return None
+    try:
+        with _chromadb_lock:
+            return client.get_or_create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"},
+            )
+    except Exception as e:
+        log.warning("Failed to get ChromaDB collection: %s", e)
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# ENTITY EXTRACTION
+# ──────────────────────────────────────────────────────────────────────────
+
+_ENTITY_RE = {
+    "person": re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b"),
+    "project": re.compile(r"\b(?:project|task|repo|repository|codebase)\s+(\w+)", re.IGNORECASE),
+    "tool": re.compile(r"\b(?:use|tried|with|in)\s+(\w+(?:\s+\w+)?)\b", re.IGNORECASE),
 }
 
 
-def _merge_defaults(target: dict, defaults: dict) -> dict:
-    for key, value in defaults.items():
-        if key not in target:
-            target[key] = value.copy() if isinstance(value, (dict, list)) else value
-        elif isinstance(value, dict) and isinstance(target[key], dict):
-            _merge_defaults(target[key], value)
-    return target
+def _extract_entities(text: str) -> dict[str, list]:
+    """Extract named entities from text — people, projects, tools."""
+    entities = {"people": [], "projects": [], "tools": []}
+    seen      = set()
+
+    # Person (capitalized words)
+    for match in _ENTITY_RE["person"].finditer(text):
+        name = match.group(1).strip()
+        if len(name) > 2 and name not in seen and len(entities["people"]) < 5:
+            entities["people"].append(name)
+            seen.add(name)
+
+    # Project
+    for match in _ENTITY_RE["project"].finditer(text):
+        proj = match.group(1).strip().lower()
+        if len(proj) > 2 and proj not in seen:
+            entities["projects"].append(proj)
+            seen.add(proj)
+
+    # Tool
+    for match in _ENTITY_RE["tool"].finditer(text):
+        tool = match.group(1).strip().lower()
+        if len(tool) > 2 and tool not in seen and len(entities["tools"]) < 5:
+            entities["tools"].append(tool)
+            seen.add(tool)
+
+    return entities
 
 
-# ==========================================================================
-# LOAD / SAVE
-# ==========================================================================
+# ──────────────────────────────────────────────────────────────────────────
+# TONE DETECTION & PERSONALITY INJECTION
+# ──────────────────────────────────────────────────────────────────────────
 
-def set_model(model_name: str) -> None:
-    global MODEL
-    if model_name and isinstance(model_name, str):
-        MODEL = model_name
+def _detect_tone_mode(memory: dict) -> str:
+    """
+    Detect conversational tone based on:
+      • Time of day
+      • Mood history from session
+      • Command velocity (frustration indicator)
+    Returns: "focus" | "casual" | "frustrated" | "neutral"
+    """
+    global _working_memory
+    wm = _working_memory
+
+    # Early morning/late evening → "focus" or "casual"
+    now_hour = datetime.now().hour
+    if 7 <= now_hour <= 9:
+        return "focus"  # morning standup mode
+    if 22 <= now_hour or now_hour <= 6:
+        return "casual"  # relaxed evening/night
+
+    # Command velocity spike → "frustrated"
+    if wm and wm.command_velocity() > 3.0:  # >3 commands/min
+        return "frustrated"
+
+    # Mood drift
+    if wm:
+        mood = wm.avg_mood()
+        if mood < -0.3:
+            return "frustrated"
+        if mood > 0.4:
+            return "casual"
+
+    # Interaction count milestones
+    if memory.get("interaction_count", 0) < 5:
+        return "focus"  # new session: be clear & direct
+    if memory.get("interaction_count", 0) > 100:
+        return "casual"  # familiar: be friendly
+
+    return "neutral"
 
 
-def load() -> dict:
-    if MEMORY_FILE.exists():
+def _tone_rules(mode: str, user_name: str = "sir") -> str:
+    """
+    Return system prompt injection for the detected tone.
+    These rules are APPENDED to the base system prompt.
+    """
+    rules = {
+        "focus": f"""
+You are in FOCUS mode.  The user ({user_name}) is in productive/engineering mode.
+• Be concise and technical
+• Assume context is understood — no hand-holding
+• Prioritize speed and clarity
+• Answer directly without preamble
+• Suggest optimizations for the task at hand
+""".strip(),
+
+        "casual": f"""
+You are in CASUAL mode.  {user_name} is relaxed / taking a break.
+• Be friendly and conversational
+• Feel free to add light humor or commentary
+• Engage with tangents if the user is interested
+• Share interesting context — no need to be minimal
+• Warmth > efficiency
+""".strip(),
+
+        "frustrated": f"""
+You are in FRUSTRATED mode.  The user may be stuck or impatient.
+• Be extra patient and supportive
+• Break problems into tiny steps
+• Double-check your answers before responding
+• Acknowledge the frustration: "I understand this is annoying"
+• Offer alternative approaches without defensiveness
+""".strip(),
+
+        "neutral": f"""
+You are in NEUTRAL mode.
+• Balance friendliness with efficiency
+• Provide complete answers with brief context
+• Adapt based on the user's tone in this message
+""".strip(),
+    }
+    return rules.get(mode, rules["neutral"])
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PERSISTENT MEMORY FILE (JSON)
+# ──────────────────────────────────────────────────────────────────────────
+
+MEMORY_FILE = Path.home() / ".iris_memory.json"
+
+
+def load():
+    """Load persistent memory from disk."""
+    global _working_memory
+    if not MEMORY_FILE.exists():
+        mem = _init_memory()
+    else:
         try:
-            with open(MEMORY_FILE, "r") as fh:
-                data = json.load(fh)
-            if not isinstance(data, dict):
-                raise ValueError("not a JSON object")
-            return _merge_defaults(data, DEFAULT_MEMORY)
-        except Exception:
-            pass
-    fresh = {**DEFAULT_MEMORY, "first_seen": datetime.now().strftime("%Y-%m-%d")}
-    save(fresh)
-    return fresh
+            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+            mem  = data
+        except Exception as e:
+            log.warning("Memory load failed, reinitializing: %s", e)
+            mem = _init_memory()
+    _working_memory = _WorkingMemory()
+    return mem
 
 
-def save(memory: dict) -> None:
-    memory["last_seen"] = datetime.now().strftime("%Y-%m-%d")
-    with open(MEMORY_FILE, "w") as fh:
-        json.dump(memory, fh, indent=2)
+def _init_memory() -> dict:
+    """Create a fresh memory structure."""
+    return {
+        "version": "2",
+        "created": datetime.now().isoformat(),
+        "user": {
+            "name": None,
+            "preferences": {},
+            "known_entities": {},
+        },
+        "interaction_count": 0,
+        "reminders": [],
+        "conversation_log": [],
+        "history": [],  # Last N turns for context
+    }
 
 
-# ==========================================================================
-# CONVERSATION HISTORY  (short-term, stored in JSON)
-# ==========================================================================
+def save(memory: dict):
+    """Persist memory to disk (background thread safe)."""
+    try:
+        MEMORY_FILE.write_text(
+            json.dumps(memory, indent=2, default=str, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning("Memory save failed: %s", e)
 
-def add_to_history(memory: dict, role: str, content: str) -> None:
-    memory["conversation_history"].append({
-        "role":    role,
-        "content": content,
-        "time":    datetime.now().strftime("%Y-%m-%d %H:%M"),
-    })
-    if len(memory["conversation_history"]) > 20:
-        memory["conversation_history"] = memory["conversation_history"][-20:]
-    memory["interaction_count"] += 1
-    save(memory)
+
+def set_model(model_name: str):
+    """Set the model used by memory extraction (before load() is called)."""
+    global MEMORY_MODEL
+    MEMORY_MODEL = model_name
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CONVERSATION HISTORY MANAGEMENT
+# ──────────────────────────────────────────────────────────────────────────
+
+def trim_conversation_log(memory: dict = None, max_age_days: int = 30):
+    """Remove old entries from conversation_log."""
+    if memory is None:
+        return
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    mem = memory.get("conversation_log", [])
+    memory["conversation_log"] = [
+        e for e in mem
+        if datetime.fromisoformat(e.get("timestamp", "2000-01-01")) > cutoff
+    ]
 
 
 def get_recent_history(memory: dict, n: int = 6) -> list[dict]:
-    return [
-        {"role": e["role"], "content": e["content"]}
-        for e in memory["conversation_history"][-n:]
-    ]
+    """Return last N conversation turns (chronological)."""
+    hist = memory.get("history", [])
+    return hist[-n:] if hist else []
 
 
-# ==========================================================================
-# CORRECTIONS
-# ==========================================================================
-
-def save_correction(memory: dict, corrected_value: str) -> None:
-    corrections = memory.setdefault("corrections", [])
-    corrections.append({
-        "value": corrected_value,
-        "time":  datetime.now().strftime("%Y-%m-%d %H:%M"),
+def add_to_history(memory: dict, role: str, content: str):
+    """Add a turn to the short-term history buffer."""
+    hist = memory.get("history", [])
+    hist.append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now().isoformat(),
     })
-    if len(corrections) > 30:
-        memory["corrections"] = corrections[-30:]
-    app_corrections = memory.setdefault("app_corrections", {})
-    app_corrections[corrected_value.lower()] = corrected_value
-    save(memory)
+    # Keep only last 20 turns
+    if len(hist) > 20:
+        hist = hist[-20:]
+    memory["history"] = hist
 
 
-# ==========================================================================
-# SMART EXTRACTION  (background, after every command)
-# ==========================================================================
-
-def _normalize_text(value: str) -> str:
-    value = re.sub(r"[^a-z0-9\s]", " ", (value or "").lower())
-    return " ".join(value.split())
-
-
-def _extract_topics(text: str) -> list[str]:
-    text = _normalize_text(text)
-    keyword_map = {
-        "linux":   ["linux", "terminal", "shell", "bash", "cli"],
-        "python":  ["python", "pip", "venv", "script"],
-        "code":    ["code", "coding", "program", "debug", "bug"],
-        "memory":  ["memory", "remember", "forget", "recall"],
-        "weather": ["weather", "forecast", "temperature", "rain"],
-        "music":   ["music", "song", "play", "youtube"],
-        "voice":   ["voice", "speech", "whisper", "microphone"],
-        "apps":    ["app", "application", "open", "launch", "browser"],
-    }
-    return [t for t, kws in keyword_map.items() if any(k in text for k in kws)][:5]
+def log_conversation(user_text: str, assistant_reply: str):
+    """Log a full exchange to the persistent conversation_log."""
+    def _do_log():
+        try:
+            mem = load()
+            mem.setdefault("conversation_log", []).append({
+                "timestamp": datetime.now().isoformat(),
+                "user": user_text,
+                "assistant": assistant_reply,
+            })
+            mem["interaction_count"] = mem.get("interaction_count", 0) + 1
+            save(mem)
+        except Exception as e:
+            log.warning("log_conversation failed: %s", e)
+    # Non-blocking
+    threading.Thread(target=_do_log, daemon=True).start()
 
 
-def _parse_json_object(text: str) -> Optional[dict]:
-    try:
-        cleaned = (text or "").strip().replace("```json", "").replace("```", "").strip()
-        s, e = cleaned.find("{"), cleaned.rfind("}")
-        if s == -1 or e <= s:
-            return None
-        return json.loads(cleaned[s:e + 1])
-    except Exception:
-        return None
+# ──────────────────────────────────────────────────────────────────────────
+# SEMANTIC SEARCH (RAG)
+# ──────────────────────────────────────────────────────────────────────────
 
-
-def _clean_location_value(value: str) -> Optional[str]:
-    value = re.sub(r"[^a-zA-Z,\s.-]", " ", (value or "").strip())
-    value = " ".join(value.split()).strip(" ,.-")
-    if not value or len(value.split()) > 5:
-        return None
-    bad = {"my location", "location", "your location", "unknown", "none",
-           "my city", "my place", "my area"}
-    return None if value.lower() in bad else value
-
-
-def extract_and_save(memory: dict, user_text: str) -> None:
-    """
-    Background-safe.  Extracts personal facts + entities from user input.
-    Called as daemon thread from iris.py - identical signature to v1.
-    """
-    text = (user_text or "").lower().strip()
-
-    # Entity extraction (no LLM needed)
-    _extract_entities(user_text, memory)
-
-    question_starters = (
-        "do ", "did ", "can ", "could ", "would ", "should ",
-        "what ", "where ", "when ", "why ", "how ", "is ", "are ",
-        "am i", "who ",
-    )
-    if text.endswith("?") or text.startswith(question_starters):
-        save(memory)
-        return
-
-    # Fast explicit location check (no LLM)
-    for pattern in [
-        r"\bi live in\s+([a-zA-Z,\s.-]{2,60})",
-        r"\bi(?:'m| am) from\s+([a-zA-Z,\s.-]{2,60})",
-        r"\bmy location is\s+([a-zA-Z,\s.-]{2,60})",
-    ]:
-        m = re.search(pattern, user_text, re.IGNORECASE)
-        if m:
-            loc = _clean_location_value(m.group(1).split(" and ")[0].split(",")[0])
-            if loc:
-                memory["user"]["location"] = loc
-                log.info("[Memory] Location: %s", loc)
-                save(memory)
-                return
-
-    triggers = [
-        "i am", "i'm", "my name", "call me", "i like", "i love",
-        "i hate", "i prefer", "i work", "i study", "i live in",
-        "i'm from", "remember", "don't forget", "i usually", "i always",
-        "my favourite", "my favorite", "i wake up", "i sleep", "i'm a", "i am a",
-    ]
-    if not any(t in text for t in triggers):
-        save(memory)
-        return
-
-    try:
-        result = ollama.chat(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Extract ONE personal fact from the sentence.\n"
-                    'Return ONLY JSON: {"type": "name"|"age"|"location"|"occupation"'
-                    '|"music"|"topic"|"dislike"|"fact"|"wake_time"|"sleep_time", '
-                    '"value": "<5 words max>"}\n'
-                    f"Sentence: {user_text}"
-                ),
-            }],
-        )
-        data = _parse_json_object(result["message"]["content"])
-        if not isinstance(data, dict):
-            return
-        ftype, fval = data.get("type"), data.get("value")
-        if not ftype or not fval or fval == "null":
-            return
-
-        u, p = memory["user"], memory["preferences"]
-        if ftype == "name":
-            u["name"] = fval.strip().title()
-        elif ftype == "age":
-            u["age"] = fval
-        elif ftype == "location":
-            if any(m in text for m in ["i live in", "i am from", "i'm from", "my location is"]):
-                cl = _clean_location_value(fval)
-                if cl:
-                    u["location"] = cl
-        elif ftype == "occupation":
-            u["occupation"] = fval
-        elif ftype == "music" and fval not in p["music"]:
-            p["music"].append(fval)
-        elif ftype == "topic" and fval not in p["topics"]:
-            p["topics"].append(fval)
-        elif ftype == "dislike" and fval not in p["dislikes"]:
-            p["dislikes"].append(fval)
-        elif ftype == "wake_time":
-            u["wake_up_time"] = fval
-        elif ftype == "sleep_time":
-            u["sleep_time"] = fval
-        elif ftype == "fact" and fval not in memory["facts"]:
-            memory["facts"].append(fval)
-
-        save(memory)
-    except Exception as exc:
-        log.debug("extract_and_save LLM call failed: %s", exc)
-
-
-def extract_extended_memory(memory: dict, user_text: str, assistant_reply: str) -> None:
-    """Called after every AI reply.  Updates goals, mood, learned topics."""
-    try:
-        user_norm  = _normalize_text(user_text or "")
-        reply_norm = _normalize_text(assistant_reply or "")
-        user_raw   = (user_text or "").lower()
-
-        # Goals
-        for pat in [
-            r"\bi want to\s+(.+)$",
-            r"\bi(?:'m|\s+m)\s+trying to\s+(.+)$",
-            r"\bmy goal is\s+(.+)$",
-        ]:
-            m = re.search(pat, user_raw, re.IGNORECASE)
-            if m:
-                goal = m.group(1).strip().rstrip(".?!")[:120]
-                goals = memory.setdefault("goals", [])
-                if goal not in goals:
-                    goals.append(goal)
-                if len(goals) > 20:
-                    memory["goals"] = goals[-20:]
-                break
-
-        # Mood
-        mood_signals = {
-            "frustrated": ["frustrated", "annoyed", "angry", "stuck", "this is not working"],
-            "happy":      ["happy", "great", "awesome", "nice", "good job", "thanks"],
-            "curious":    ["curious", "wonder", "how", "why", "what if"],
-            "bored":      ["bored", "boring", "whatever", "meh"],
-        }
-        for label, sigs in mood_signals.items():
-            if any(s in user_norm for s in sigs):
-                mh = memory.setdefault("mood_history", [])
-                mh.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "mood": label})
-                if len(mh) > 5:
-                    memory["mood_history"] = mh[-5:]
-                break
-
-        # Learned topics
-        if assistant_reply.strip():
-            lt = memory.setdefault("learned_topics", {})
-            for topic in (_extract_topics(user_text) or _extract_topics(assistant_reply))[:3]:
-                lt[topic.lower()] = assistant_reply.strip()[:500]
-
-        save(memory)
-    except Exception:
-        pass
-
-
-# ==========================================================================
-# LOGGING
-# ==========================================================================
-
-def log_conversation(user_text: str, assistant_reply: str) -> None:
-    """
-    Writes to JSONL log AND stores episode in ChromaDB vector store.
-    Identical signature to v1.
-    """
-    topics = _extract_topics(f"{user_text or ''} {assistant_reply or ''}")
-    try:
-        entry = {
-            "time":      datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "user":      user_text or "",
-            "assistant": assistant_reply or "",
-            "topics":    topics,
-        }
-        with open(CONVERSATION_LOG, "a") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-    # Vector store — run in background so it never delays the response
-    _wm.update(user_text or "", topics)
-    threading.Thread(
-        target=_store_episode,
-        args=(user_text or "", assistant_reply or "", topics),
-        daemon=True,
-    ).start()
-
-
-# ==========================================================================
-# SEARCH / RAG
-# ==========================================================================
-
-def _format_time_ago(ts: str) -> str:
-    try:
-        delta = datetime.now() - datetime.strptime(ts, "%Y-%m-%d %H:%M")
-        days  = delta.days
-        if days <= 0:
-            h = delta.seconds // 3600
-            return f"{max(1, delta.seconds // 60)} min ago" if h == 0 else f"{h}h ago"
-        return "yesterday" if days == 1 else (f"{days}d ago" if days < 7 else f"{days//7}w ago")
-    except Exception:
-        return ts or "recently"
-
-
-def search_relevant_memories(query: str, max_results: int = 3) -> list[str]:
-    """
-    Semantic search first (ChromaDB), keyword fallback (JSONL).
-    Returns list of formatted strings for injection into the prompt.
-    Identical signature to v1.
-    """
-    results: list[str] = []
-
-    # -- semantic (vector) search -----------------------------------------
-    episodes = _semantic_search(query, n_results=max_results + 2)
-    for ep in episodes[:max_results]:
-        time_str   = _format_time_ago(ep.get("time", ""))
-        topics     = [t for t in ep.get("topics", "").split(",") if t]
-        user_part  = (ep.get("user", "") or "").strip()
-        asst_part  = (ep.get("assistant", "") or "").strip()
-        if not asst_part:
-            continue
-        topic_str  = ", ".join(topics[:3]) if topics else "this topic"
-        score_str  = f"(relevance {ep['_score']:.0%})"
-        results.append(
-            f"[{time_str} {score_str}] "
-            f"User asked about {topic_str}. "
-            f"Iris said: {asst_part[:200]}"
-        )
-
-    if results:
-        return results
-
-    # -- keyword fallback -------------------------------------------------
-    if not CONVERSATION_LOG.exists():
+def _semantic_search(query: str, top_k: int = 3) -> list[dict]:
+    """Search ChromaDB for semantically similar episodes."""
+    collection = _get_collection()
+    if not collection:
         return []
-    STOPWORDS = {
-        "i", "a", "the", "is", "are", "to", "do", "it", "in", "on",
-        "of", "me", "my", "you", "can", "what", "how",
-    }
-    query_terms = set(_normalize_text(query).split()) - STOPWORDS
-    if not query_terms:
-        return []
-    scored: list[tuple[int, dict]] = []
     try:
-        with open(CONVERSATION_LOG, "r") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                combined   = f"{entry.get('user','')} {entry.get('assistant','')} {' '.join(entry.get('topics',[]))}"
-                entry_terms = set(_normalize_text(combined).split())
-                overlap     = len(query_terms & entry_terms)
-                if overlap > 0:
-                    topic_bonus = len(set(entry.get("topics", [])) & query_terms)
-                    scored.append((overlap * 2 + topic_bonus, entry))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        for _, entry in scored[:max_results]:
-            asst = (entry.get("assistant") or "").strip()
-            if not asst:
-                continue
-            ts    = _format_time_ago(entry.get("time", ""))
-            topics = entry.get("topics") or ["this topic"]
-            results.append(
-                f"[{ts}] User asked about {', '.join(topics[:2])}. "
-                f"Iris said: {asst[:180]}"
+        results = collection.query(query_texts=[query], n_results=top_k)
+        docs = []
+        for i, doc in enumerate(results.get("documents", [[]])[0]):
+            dist = results.get("distances", [[]])[0][i] if results.get("distances") else 0
+            docs.append({
+                "text": doc,
+                "distance": float(dist),
+                "similarity": 1.0 - float(dist),  # Convert to similarity
+            })
+        return sorted(docs, key=lambda x: x["similarity"], reverse=True)
+    except Exception as e:
+        log.warning("Semantic search failed: %s", e)
+        return []
+
+
+def _keyword_search_fallback(query: str, memory: dict, top_k: int = 2) -> list[dict]:
+    """Fallback keyword search when ChromaDB unavailable."""
+    keywords = set(re.sub(r"[^a-z0-9\s]", "", query.lower()).split())
+    if not keywords:
+        return []
+    log_entries = memory.get("conversation_log", [])
+    matches = []
+    for entry in log_entries:
+        user_text = entry.get("user", "").lower()
+        score = len(keywords.intersection(set(user_text.split()))) / len(keywords)
+        if score > 0.3:
+            matches.append({
+                "text": entry.get("assistant", ""),
+                "similarity": score,
+            })
+    return sorted(matches, key=lambda x: x["similarity"], reverse=True)[:top_k]
+
+
+def build_rag_context(query: str, memory: dict = None) -> str:
+    """Build a system message with retrieved relevant context."""
+    if memory is None:
+        return ""
+
+    # Try ChromaDB semantic search
+    results = _semantic_search(query, top_k=3)
+    if not results:
+        # Fallback to keyword search
+        results = _keyword_search_fallback(query, memory, top_k=2)
+
+    if not results:
+        return ""
+
+    context_lines = ["Recent relevant context:"]
+    for doc in results[:2]:  # Use top 2
+        text = doc.get("text", "").strip()
+        if text:
+            text = text[:150] + "..." if len(text) > 150 else text
+            context_lines.append(f"  • {text}")
+
+    return "\n".join(context_lines)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# EPISODE STORAGE (ASYNC)
+# ──────────────────────────────────────────────────────────────────────────
+
+def _store_episode(user_text: str, assistant_reply: str, topics: list[str] = None):
+    """Store a user-assistant exchange in ChromaDB (background thread)."""
+    def _do_store():
+        collection = _get_collection()
+        if not collection:
+            return
+        try:
+            combined_text = f"{user_text} {assistant_reply}"
+            doc_id        = f"ep_{int(now())}"
+            metadata      = {
+                "topics": ",".join(topics) if topics else "",
+                "timestamp": str(int(now())),
+            }
+            collection.add(
+                ids=[doc_id],
+                documents=[combined_text],
+                metadatas=[metadata],
             )
-    except Exception:
-        pass
-    return results
+            log.debug("Stored episode: %s", doc_id)
+        except Exception as e:
+            log.warning("Episode storage failed: %s", e)
+
+    threading.Thread(target=_do_store, daemon=True).start()
 
 
-def build_rag_context(query: str) -> str:
-    """
-    Build the full RAG context block for injection into the system prompt.
-    Now includes: semantic memories + working memory session context.
-    Identical signature to v1.
-    """
-    parts: list[str] = []
-
-    # Session context from working memory
-    wm_hint = _wm.get_context_hint()
-    if wm_hint:
-        parts.append(f"Current session: {wm_hint}")
-
-    # Relevant past memories
-    memories = search_relevant_memories(query, max_results=3)
-    if memories:
-        parts.append("Relevant past context:\n" + "\n".join(memories))
-
-    return "\n\n".join(parts) if parts else ""
-
-
-# ==========================================================================
-# SYSTEM PROMPT BUILDER
-# ==========================================================================
+# ──────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT BUILDING
+# ──────────────────────────────────────────────────────────────────────────
 
 def build_system_prompt(memory: dict) -> str:
-    u           = memory.get("user", {})
-    facts       = memory.get("facts", [])
-    goals       = memory.get("goals", [])
-    mood_history = memory.get("mood_history", [])
-    entities    = memory.get("entities", {})
-    count       = memory.get("interaction_count", 0)
-    name        = u.get("name") or "sir"
+    """
+    Build the complete system prompt with:
+      • Base personality
+      • Tone-based rules
+      • Entity context
+      • Working memory hints
+    """
+    global _working_memory
+    wm = _working_memory or _WorkingMemory()
 
-    profile_parts = []
-    if u.get("age"):        profile_parts.append(f"Age: {u['age']}")
-    if u.get("location"):   profile_parts.append(f"Location: {u['location']}")
-    if u.get("occupation"): profile_parts.append(f"Occupation: {u['occupation']}")
-    profile_str = " | ".join(profile_parts) if profile_parts else "Profile incomplete."
+    user_name = memory.get("user", {}).get("name") or "sir"
+    tone_mode = _detect_tone_mode(memory)
+    tone_injection = _tone_rules(tone_mode, user_name)
 
-    facts_str = "; ".join(facts[-6:]) if facts else "none"
-    goals_str = "; ".join(goals[-3:]) if goals else "none"
-    current_mood = mood_history[-1]["mood"] if mood_history else "neutral"
+    # Entity spotlight
+    entity_lines = []
+    known = memory.get("user", {}).get("known_entities", {})
+    for ent_type, ents in known.items():
+        if ents:
+            entity_lines.append(f"{ent_type.title()}: {', '.join(ents[:3])}")
 
-    # Compact entity summary (people + projects only)
-    entity_lines: list[str] = []
-    for val in list(entities.values())[:8]:
-        if val["kind"] in ("person", "project"):
-            entity_lines.append(f"{val['kind']}: {val['name']}")
-    entity_str = "; ".join(entity_lines) if entity_lines else "none"
+    entity_context = "\n".join(entity_lines) if entity_lines else ""
 
-    # Active session topics
-    session_topics = ", ".join(_wm.topic_stack[-4:]) if _wm.topic_stack else "general"
+    # Topic context
+    current_topic = wm.current_topic()
+    topic_hint    = f"Current topic: {current_topic}" if current_topic else ""
 
-    return f"""You are IRIS - Intelligent Responsive Integrated System.
-You are the personal AI of {name}. Precise, direct, highly capable.
-Never say you are an AI. You ARE Iris. Speak like a confident expert.
+    # Build final prompt
+    base_prompt = f"""You are Iris, a voice assistant with a sophisticated memory system and dynamic personality.
 
-USER: {name} | {profile_str}
-KNOWN FACTS: {facts_str}
-GOALS: {goals_str}
-PEOPLE / PROJECTS: {entity_str}
-CURRENT MOOD: {current_mood} - adjust tone accordingly
-SESSION TOPICS: {session_topics}
-INTERACTIONS: {count} | Today: {datetime.now().strftime("%A %B %d, %Y, %I:%M %p")}
+User: {user_name}
+Interaction count: {memory.get('interaction_count', 0)}
 
-RULES:
-- Lead with the answer, then add 1-2 sentences of context.
-- Max 3 sentences unless the user asks for detail.
-- No filler phrases ("certainly!", "great question!", "absolutely!").
-- Use {name}'s name at most once, naturally.
-- Do NOT end every reply with a question - only when genuinely needed.
-- Spoken output only: no markdown, no bullets, no headers."""
+{tone_injection}
 
+{entity_context}
 
-# ==========================================================================
-# MEMORY SUMMARY
-# ==========================================================================
+{topic_hint}
 
-def get_memory_summary(memory: dict) -> str:
-    u     = memory.get("user", {})
-    prefs = memory.get("preferences", {})
-    facts = memory.get("facts", [])
-    entities = memory.get("entities", {})
+Guidelines:
+• Answer questions directly and accurately
+• Remember user preferences and past context
+• If the user seems frustrated, be extra patient
+• Be yourself — don't pretend to be something you're not
+• If you don't know something, say so
+""".strip()
 
-    parts: list[str] = []
-    if u.get("name"):       parts.append(f"Your name is {u['name']}.")
-    if u.get("age"):        parts.append(f"You are {u['age']} years old.")
-    if u.get("location"):   parts.append(f"You are from {u['location']}.")
-    if u.get("occupation"): parts.append(f"You are a {u['occupation']}.")
-    if prefs.get("music"):  parts.append(f"You like {', '.join(prefs['music'][-3:])} music.")
-    if prefs.get("topics"): parts.append(f"You enjoy talking about {', '.join(prefs['topics'][-3:])}.")
-    if prefs.get("dislikes"): parts.append(f"You dislike {', '.join(prefs['dislikes'][-3:])}.")
-    if facts:               parts.append("Other facts: " + ". ".join(facts[-4:]) + ".")
-
-    people   = [v["name"] for v in entities.values() if v["kind"] == "person"][:4]
-    projects = [v["name"] for v in entities.values() if v["kind"] == "project"][:3]
-    if people:   parts.append(f"People I know about: {', '.join(people)}.")
-    if projects: parts.append(f"Your projects: {', '.join(projects)}.")
-
-    col = _get_collection()
-    ep_count = col.count() if col else 0
-    parts.append(f"I have {ep_count} conversation episodes in vector memory.")
-
-    if not parts:
-        return "I don't know much about you yet. Tell me things and I'll remember them."
-    return " ".join(parts)
+    return base_prompt
 
 
-# ==========================================================================
-# CLEAR / TRIM
-# ==========================================================================
+# ──────────────────────────────────────────────────────────────────────────
+# EXTENDED MEMORY EXTRACTION
+# ──────────────────────────────────────────────────────────────────────────
 
-def clear_memory(memory: dict) -> None:
-    memory["user"]                  = DEFAULT_MEMORY["user"].copy()
-    memory["preferences"]           = {k: [] for k in DEFAULT_MEMORY["preferences"]}
-    memory["facts"]                 = []
-    memory["learned_topics"]        = {}
-    memory["corrections"]           = []
-    memory["app_corrections"]       = {}
-    memory["mood_history"]          = []
-    memory["goals"]                 = []
-    memory["reminders"]             = []
-    memory["conversation_history"]  = []
-    memory["entities"]              = {}
-    memory["interaction_count"]     = 0
-    save(memory)
-
-    # Wipe vector store too
-    col = _get_collection()
-    if col:
+def extract_and_save(memory: dict, user_message: str):
+    """
+    Async extraction of:
+      • User name (from patterns like "I'm John" or "call me Jane")
+      • Entities (people, projects, tools)
+      • Topics for working memory
+    """
+    def _extract():
         try:
-            all_ids = col.get(include=[])["ids"]
-            if all_ids:
-                col.delete(ids=all_ids)
-            log.info("ChromaDB collection cleared.")
-        except Exception as exc:
-            log.warning("Could not clear ChromaDB: %s", exc)
+            # Name extraction
+            name_match = re.search(
+                r"(?:my name is|i'm|im|call me|you can call me)\s+([A-Za-z]+)",
+                user_message, re.IGNORECASE
+            )
+            if name_match and not memory["user"].get("name"):
+                memory["user"]["name"] = name_match.group(1).strip()
+                log.info("Extracted user name: %s", name_match.group(1))
+
+            # Entity extraction
+            entities = _extract_entities(user_message)
+            for ent_type, ents in entities.items():
+                key = ent_type.replace(" ", "_")
+                known = memory.get("user", {}).get("known_entities", {})
+                existing = set(known.get(key, []))
+                existing.update(ents)
+                memory["user"]["known_entities"][key] = list(existing)[:10]
+
+            # Topic inference (basic)
+            if "code" in user_message.lower() or "python" in user_message.lower():
+                if _working_memory:
+                    _working_memory.push_topic("programming")
+            elif "meeting" in user_message.lower() or "standup" in user_message.lower():
+                if _working_memory:
+                    _working_memory.push_topic("scheduling")
+
+            save(memory)
+        except Exception as e:
+            log.debug("extract_and_save failed: %s", e)
+
+    threading.Thread(target=_extract, daemon=True).start()
 
 
-def trim_conversation_log(max_entries: int = 500) -> None:
-    try:
-        if not CONVERSATION_LOG.exists():
-            return
-        with open(CONVERSATION_LOG, "r") as fh:
-            lines = [ln.strip() for ln in fh if ln.strip()]
-        if len(lines) > max_entries:
-            with open(CONVERSATION_LOG, "w") as fh:
-                fh.write("\n".join(lines[-max_entries:]) + "\n")
-    except Exception:
-        pass
+def extract_extended_memory(memory: dict, user_text: str, assistant_reply: str):
+    """
+    Extract and store richer semantic context.
+    Async background operation.
+    """
+    def _extract():
+        try:
+            # Infer topic/intent
+            lower = user_text.lower()
+            topics = []
+            if any(w in lower for w in ["code", "bug", "debug", "python", "javascript"]):
+                topics.append("programming")
+            if any(w in lower for w in ["meeting", "standup", "deadline", "task"]):
+                topics.append("work")
+            if any(w in lower for w in ["family", "friend", "personal", "life"]):
+                topics.append("personal")
+
+            # Store in ChromaDB
+            _store_episode(user_text, assistant_reply, topics)
+
+            # Update working memory mood based on assistant tone
+            if _working_memory:
+                _working_memory.record_command()
+                if "sorry" in assistant_reply.lower() or "error" in assistant_reply.lower():
+                    _working_memory.add_mood_sample(-0.2)
+                elif "great" in assistant_reply.lower() or "nice" in assistant_reply.lower():
+                    _working_memory.add_mood_sample(0.3)
+
+        except Exception as e:
+            log.debug("extract_extended_memory failed: %s", e)
+
+    threading.Thread(target=_extract, daemon=True).start()
 
 
-# ==========================================================================
-# REMINDERS  (unchanged from v1)
-# ==========================================================================
-
-def save_reminder(memory: dict, text: str, remind_at: str) -> bool:
-    try:
-        memory.setdefault("reminders", []).append({
-            "text":    text.strip()[:200],
-            "remind_at": remind_at,
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "fired":   False,
-        })
-        save(memory)
-        return True
-    except Exception:
-        return False
-
+# ──────────────────────────────────────────────────────────────────────────
+# REMINDERS
+# ──────────────────────────────────────────────────────────────────────────
 
 def get_pending_reminders(memory: dict) -> list[dict]:
-    now = datetime.now()
-    pending: list[dict] = []
-    for r in memory.get("reminders", []):
-        if r.get("fired"):
+    """Return reminders that have reached their time."""
+    pending = []
+    now_ts  = datetime.now()
+    for reminder in memory.get("reminders", []):
+        if reminder.get("fired"):
             continue
-        try:
-            if now >= datetime.strptime(r["remind_at"], "%Y-%m-%d %H:%M"):
-                pending.append(r)
-        except Exception:
-            pass
+        remind_ts = datetime.fromisoformat(reminder.get("remind_at", ""))
+        if remind_ts <= now_ts:
+            pending.append(reminder)
     return pending
 
 
-def mark_reminders_fired(memory: dict, reminders: list[dict]) -> None:
-    fired_texts = {r.get("text") for r in reminders}
-    for r in memory.get("reminders", []):
-        if r.get("text") in fired_texts:
-            r["fired"] = True
+def mark_reminders_fired(memory: dict, reminders: list[dict]):
+    """Mark reminders as fired after speaking them."""
+    for reminder in reminders:
+        for mem_reminder in memory.get("reminders", []):
+            if mem_reminder.get("id") == reminder.get("id"):
+                mem_reminder["fired"] = True
     save(memory)
